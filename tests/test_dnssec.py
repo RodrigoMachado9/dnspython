@@ -151,8 +151,8 @@ abs_ecdsa384_soa_rrsig = dns.rrset.from_text('example.', 86400, 'IN', 'RRSIG',
 
 
 
-@unittest.skipUnless(dns.dnssec._have_pycrypto,
-                     "Pycryptodome cannot be imported")
+@unittest.skipUnless(dns.dnssec._have_pyca,
+                     "Python Cryptography cannot be imported")
 class DNSSECValidatorTestCase(unittest.TestCase):
 
     def testAbsoluteRSAGood(self): # type: () -> None
@@ -199,28 +199,20 @@ class DNSSECValidatorTestCase(unittest.TestCase):
         ds = dns.dnssec.make_ds(abs_example, example_sep_key, 'SHA256')
         self.failUnless(ds == example_ds_sha256)
 
-    @unittest.skipUnless(dns.dnssec._have_ecdsa,
-                         "python ECDSA cannot be imported")
     def testAbsoluteECDSA256Good(self): # type: () -> None
         dns.dnssec.validate(abs_ecdsa256_soa, abs_ecdsa256_soa_rrsig,
                             abs_ecdsa256_keys, None, when3)
 
-    @unittest.skipUnless(dns.dnssec._have_ecdsa,
-                         "python ECDSA cannot be imported")
     def testAbsoluteECDSA256Bad(self): # type: () -> None
         def bad(): # type: () -> None
             dns.dnssec.validate(abs_other_ecdsa256_soa, abs_ecdsa256_soa_rrsig,
                                 abs_ecdsa256_keys, None, when3)
         self.failUnlessRaises(dns.dnssec.ValidationFailure, bad)
 
-    @unittest.skipUnless(dns.dnssec._have_ecdsa,
-                         "python ECDSA cannot be imported")
     def testAbsoluteECDSA384Good(self): # type: () -> None
         dns.dnssec.validate(abs_ecdsa384_soa, abs_ecdsa384_soa_rrsig,
                             abs_ecdsa384_keys, None, when4)
 
-    @unittest.skipUnless(dns.dnssec._have_ecdsa,
-                         "python ECDSA cannot be imported")
     def testAbsoluteECDSA384Bad(self): # type: () -> None
         def bad(): # type: () -> None
             dns.dnssec.validate(abs_other_ecdsa384_soa, abs_ecdsa384_soa_rrsig,

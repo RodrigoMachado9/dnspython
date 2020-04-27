@@ -17,6 +17,7 @@
 
 """Common DNSSEC-related functions and constants."""
 
+import hashlib  # used in make_ds() to avoid pycrypto dependency
 from io import BytesIO
 import struct
 import time
@@ -165,10 +166,10 @@ def make_ds(name, key, algorithm, origin=None):
 
     if algorithm.upper() == 'SHA1':
         dsalg = 1
-        hash = SHA1.new()
+        hash = hashlib.sha1()
     elif algorithm.upper() == 'SHA256':
         dsalg = 2
-        hash = SHA256.new()
+        hash = hashlib.sha256()
     else:
         raise UnsupportedAlgorithm('unsupported algorithm "%s"' % algorithm)
 
@@ -214,7 +215,7 @@ def _is_dsa(algorithm):
 
 
 def _is_ecdsa(algorithm):
-    return _have_ecdsa and (algorithm in (ECDSAP256SHA256, ECDSAP384SHA384))
+    return (algorithm in (ECDSAP256SHA256, ECDSAP384SHA384))
 
 
 def _is_md5(algorithm):
@@ -240,16 +241,24 @@ def _is_sha512(algorithm):
 
 def _make_hash(algorithm):
     if _is_md5(algorithm):
-        return MD5.new()
+        return hashes.MD5()
     if _is_sha1(algorithm):
-        return SHA1.new()
+        return hashes.SHA1()
     if _is_sha256(algorithm):
-        return SHA256.new()
+        return hashes.SHA256()
     if _is_sha384(algorithm):
-        return SHA384.new()
+        return hashes.SHA384()
     if _is_sha512(algorithm):
-        return SHA512.new()
+        return hashes.SHA512()
+    if algorithm == ED25519:
+        return hashes.SHA512()
+    if algorithm == ED448:
+        return hashes.SHAKE256(114)
     raise ValidationFailure('unknown hash for algorithm %u' % algorithm)
+
+
+def _bytes_to_long(b):
+    return int.from_bytes(b, 'big')
 
 
 def _make_algorithm_id(algorithm):
@@ -316,8 +325,6 @@ def _validate_rrsig(rrset, rrsig, keys, origin=None, now=None):
         if rrsig.inception > now:
             raise ValidationFailure('not yet valid')
 
-        hash = _make_hash(rrsig.algorithm)
-
         if _is_rsa(rrsig.algorithm):
             keyptr = candidate_key.key
             (bytes_,) = struct.unpack('!B', keyptr[0:1])
@@ -328,9 +335,9 @@ def _validate_rrsig(rrset, rrsig, keys, origin=None, now=None):
             rsa_e = keyptr[0:bytes_]
             rsa_n = keyptr[bytes_:]
             try:
-                pubkey = CryptoRSA.construct(
-                    (number.bytes_to_long(rsa_n),
-                     number.bytes_to_long(rsa_e)))
+                public_key = rsa.RSAPublicNumbers(
+                    _bytes_to_long(rsa_e),
+                    _bytes_to_long(rsa_n)).public_key(default_backend())
             except ValueError:
                 raise ValidationFailure('invalid public key')
             sig = rrsig.signature
@@ -346,42 +353,47 @@ def _validate_rrsig(rrset, rrsig, keys, origin=None, now=None):
             dsa_g = keyptr[0:octets]
             keyptr = keyptr[octets:]
             dsa_y = keyptr[0:octets]
-            pubkey = CryptoDSA.construct(
-                (number.bytes_to_long(dsa_y),
-                 number.bytes_to_long(dsa_g),
-                 number.bytes_to_long(dsa_p),
-                 number.bytes_to_long(dsa_q)))
-            sig = rrsig.signature[1:]
+            try:
+                public_key = dsa.DSAPublicNumbers(
+                    _bytes_to_long(dsa_y),
+                    dsa.DSAParameterNumbers(
+                        _bytes_to_long(dsa_p),
+                        _bytes_to_long(dsa_q),
+                        _bytes_to_long(dsa_g))).public_key(default_backend())
+            except ValueError:
+                raise ValidationFailure('invalid public key')
+            sig_r = rrsig.signature[1:21]
+            sig_s = rrsig.signature[21:]
+            sig = utils.encode_dss_signature(_bytes_to_long(sig_r),
+                                             _bytes_to_long(sig_s))
         elif _is_ecdsa(rrsig.algorithm):
-            # use ecdsa for NIST-384p -- not currently supported by pycryptodome
-
             keyptr = candidate_key.key
-
             if rrsig.algorithm == ECDSAP256SHA256:
-                curve = ecdsa.curves.NIST256p
-                key_len = 32
+                curve = ec.SECP256R1()
+                octets = 32
             elif rrsig.algorithm == ECDSAP384SHA384:
-                curve = ecdsa.curves.NIST384p
-                key_len = 48
-
-            x = number.bytes_to_long(keyptr[0:key_len])
-            y = number.bytes_to_long(keyptr[key_len:key_len * 2])
-            if not ecdsa.ecdsa.point_is_valid(curve.generator, x, y):
-                raise ValidationFailure('invalid ECDSA key')
-            point = ecdsa.ellipticcurve.Point(curve.curve, x, y, curve.order)
-            verifying_key = ecdsa.keys.VerifyingKey.from_public_point(point,
-                                                                      curve)
-            pubkey = ECKeyWrapper(verifying_key, key_len)
-            r = rrsig.signature[:key_len]
-            s = rrsig.signature[key_len:]
-            sig = ecdsa.ecdsa.Signature(number.bytes_to_long(r),
-                                        number.bytes_to_long(s))
+                curve = ec.SECP384R1()
+                octets = 48
+            ecdsa_x = keyptr[0:octets]
+            ecdsa_y = keyptr[octets:octets * 2]
+            try:
+                public_key = ec.EllipticCurvePublicNumbers(
+                    curve=curve,
+                    x=_bytes_to_long(ecdsa_x),
+                    y=_bytes_to_long(ecdsa_y)).public_key(default_backend())
+            except ValueError:
+                raise ValidationFailure('invalid public key')
+            sig_r = rrsig.signature[0:octets]
+            sig_s = rrsig.signature[octets:]
+            sig = utils.encode_dss_signature(_bytes_to_long(sig_r),
+                                             _bytes_to_long(sig_s))
 
         else:
             raise ValidationFailure('unknown algorithm %u' % rrsig.algorithm)
 
-        hash.update(_to_rdata(rrsig, origin)[:18])
-        hash.update(rrsig.signer.to_digestable(origin))
+        data = b''
+        data += _to_rdata(rrsig, origin)[:18]
+        data += rrsig.signer.to_digestable(origin)
 
         if rrsig.labels < len(rrname) - 1:
             suffix = rrname.split(rrsig.labels + 1)[1]
@@ -391,25 +403,21 @@ def _validate_rrsig(rrset, rrsig, keys, origin=None, now=None):
                               rrsig.original_ttl)
         rrlist = sorted(rdataset)
         for rr in rrlist:
-            hash.update(rrnamebuf)
-            hash.update(rrfixed)
+            data += rrnamebuf
+            data += rrfixed
             rrdata = rr.to_digestable(origin)
             rrlen = struct.pack('!H', len(rrdata))
-            hash.update(rrlen)
-            hash.update(rrdata)
+            data += rrlen
+            data += rrdata
 
+        chosen_hash = _make_hash(rrsig.algorithm)
         try:
             if _is_rsa(rrsig.algorithm):
-                verifier = pkcs1_15.new(pubkey)
-                # will raise ValueError if verify fails:
-                verifier.verify(hash, sig)
+                public_key.verify(sig, data, padding.PKCS1v15(), chosen_hash)
             elif _is_dsa(rrsig.algorithm):
-                verifier = DSS.new(pubkey, 'fips-186-3')
-                verifier.verify(hash, sig)
+                public_key.verify(sig, data, chosen_hash)
             elif _is_ecdsa(rrsig.algorithm):
-                digest = hash.digest()
-                if not pubkey.verify(digest, sig):
-                    raise ValueError
+                public_key.verify(sig, data, ec.ECDSA(chosen_hash))
             else:
                 # Raise here for code clarity; this won't actually ever happen
                 # since if the algorithm is really unknown we'd already have
@@ -417,7 +425,7 @@ def _validate_rrsig(rrset, rrsig, keys, origin=None, now=None):
                 raise ValidationFailure('unknown algorithm %u' % rrsig.algorithm)
             # If we got here, we successfully verified so we can return without error
             return
-        except ValueError:
+        except InvalidSignature:
             # this happens on an individual validation failure
             continue
     # nothing verified -- raise failure:
@@ -477,43 +485,19 @@ def _need_pycrypto(*args, **kwargs):
 
 
 try:
-    try:
-        # test we're using pycryptodome, not pycrypto (which misses SHA1 for example)
-        from Crypto.Hash import MD5, SHA1, SHA256, SHA384, SHA512
-        from Crypto.PublicKey import RSA as CryptoRSA, DSA as CryptoDSA
-        from Crypto.Signature import pkcs1_15, DSS
-        from Crypto.Util import number
-    except ImportError:
-        from Cryptodome.Hash import MD5, SHA1, SHA256, SHA384, SHA512
-        from Cryptodome.PublicKey import RSA as CryptoRSA, DSA as CryptoDSA
-        from Cryptodome.Signature import pkcs1_15, DSS
-        from Cryptodome.Util import number
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.asymmetric import utils
+    from cryptography.hazmat.primitives.asymmetric import dsa
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric import rsa
 except ImportError:
-    validate = _need_pycrypto
-    validate_rrsig = _need_pycrypto
-    _have_pycrypto = False
-    _have_ecdsa = False
+    validate = _need_pyca
+    validate_rrsig = _need_pyca
+    _have_pyca = False
 else:
     validate = _validate
     validate_rrsig = _validate_rrsig
-    _have_pycrypto = True
-
-    try:
-        import ecdsa
-        import ecdsa.ecdsa
-        import ecdsa.ellipticcurve
-        import ecdsa.keys
-    except ImportError:
-        _have_ecdsa = False
-    else:
-        _have_ecdsa = True
-
-        class ECKeyWrapper(object):
-
-            def __init__(self, key, key_len):
-                self.key = key
-                self.key_len = key_len
-
-            def verify(self, digest, sig):
-                diglong = number.bytes_to_long(digest)
-                return self.key.pubkey.verifies(diglong, sig)
+    _have_pyca = True
